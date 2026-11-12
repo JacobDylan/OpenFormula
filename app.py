@@ -754,33 +754,6 @@ with st.sidebar:
             ),
             "default_known_formula": "Bolomey's Law — cement/water ratio (concrete strength)",
         },
-        "Fiber-reinforced concrete strength": {
-            "file": "concrete_fiber.xlsx",
-            "rename": {
-                "Cement\n(kg/m3)": "cement", "Water\n(kg/m3)": "water",
-                "Sand\n(kg/m3)": "fine_agg", "Coarse\nAggregate\n(kg/m^{3} )": "coarse_agg",
-                "Superplastic\nizer (%)": "superplasticizer", "Silica\nFume (%)": "silica_fume",
-                "Fly\nAsh\n(%)": "flyash", "Vf of the Hooked\nSteel Fiber (%)": "fiber_vol_pct",
-                "Fiber\nLength\n(mm)": "fiber_length_mm", "Fiber Dia\n(mm)": "fiber_dia_mm",
-                "Compressive\nStrength MPa\n(28 days)": "strength",
-            },
-            "info": (
-                "Using the bundled fiber-reinforced concrete mix dataset: predicting 28-day "
-                "compressive strength (MPa) from mix proportions (cement, water, coarse/fine "
-                "aggregate, silica fume, fly ash) plus steel-fiber reinforcement details (volume "
-                "fraction, length, diameter). Columns are named to match the other bundled "
-                "concrete mix dataset (Yeh, 1998) where the same quantity is present -- "
-                "`cement`/`water`/`coarse_agg`/`fine_agg`/`flyash`/`strength` -- so formulas "
-                "written for one will mostly work on the other. One caveat: `superplasticizer` "
-                "and `flyash` here are in % (likely of cement mass), not the kg/m3 used in the "
-                "Yeh dataset -- fine for Bolomey's Law (only uses the `cement`/`water` ratio, "
-                "both in kg/m3 here, same as Yeh), but don't mix the two datasets' `superplasticizer`/"
-                "`flyash` values together. Bolomey's Law has been pre-selected below; Feret's Law "
-                "still needs an `air` column neither concrete dataset has, so it won't work here "
-                "either. Try target = last column (`strength`)."
-            ),
-            "default_known_formula": "Bolomey's Law — cement/water ratio (concrete strength)",
-        },
         "Lap-splice bond strength (ACI 408 / Orangun-Jirsa-Breen)": {
             "file": "lap_splice_bond_strength.xlsx",
             "rename": {"fsmc ": "fsmc"},
@@ -800,29 +773,6 @@ with st.sidebar:
                 "\"Known formula\" dropdown below -- not a ready-to-use fit on this data as-is, "
                 "which is exactly what makes it a good showcase for letting GEP discover/correct "
                 "the rest."
-            ),
-            "default_known_formula": "Waldron and Skillen",
-        },
-        "Lap splice PIML Waldron (engineered features)": {
-            "file": "lap_splice_piml_waldron.xlsx",
-            "rename": {"fsmc ": "fsmc"},
-            "drop": ["ΣAt.1"],
-            "info": (
-                "Same 827-row lap-splice/bond-strength database as the plain \"Lap-splice bond "
-                "strength\" demo above, plus four physics-informed engineered features built from "
-                "individual pieces of the Waldron and Skillen force-based splice formula "
-                "((5*sqrt(fcm)*Asp + fyt*ΣAt) / (Ab*Nb) / 1000): `Asp/db^2` = splice bond area "
-                "normalized by bar diameter squared; `Nb*Ab` = total bar area spliced (the "
-                "formula's denominator, minus the /1000 scaling); `Asp*√f'c` = the concrete-bond "
-                "numerator term (`Asp` x sqrt of mean concrete strength `fcm`). A fifth column, "
-                "`ΣAt.1`, was an exact duplicate of the existing `ΣAt` column in the source file "
-                "and has been dropped here to avoid offering GEP two identical terminals. All "
-                "other columns match the plain lap-splice dataset (`ls`, `db`, `Ab`, `Nb`, `cso`, "
-                "`csi`, `cb`, `dtr`, `At`, `Ns`, `Nl`, `fcm`, `fyt`, `Asp`, `ΣAt`). Try target = "
-                "last column (`fsmc`, measured splice bar stress, ksi). The Waldron and Skillen "
-                "formula is pre-selected below -- with these engineered pieces already exposed as "
-                "columns, this is a good demo of whether GEP can recombine them (plus discover any "
-                "remaining correction terms) to beat the formula's un-fitted correlation."
             ),
             "default_known_formula": "Waldron and Skillen",
         },
@@ -930,22 +880,7 @@ with st.sidebar:
             "default_known_formula": "ACI 318-19/-25 — Two-way shear stress vc (λs, βc, αs, k_ecc)",
         },
     }
-    # Trimmed the "Demo dataset" dropdown down to the four the user wants
-    # front-and-center (beam shear, concrete mix, lap-splice ACI 408, and
-    # corroded RC beam). The other two stay fully defined in DEMO_DATASETS
-    # above -- just filtered out of the options list below -- so they can be
-    # brought back later by shortening this set, same approach as
-    # HIDDEN_FORMULAS further down for the known-formula dropdown.
-    HIDDEN_DEMOS = {
-        "Fiber-reinforced concrete strength",
-        "Lap splice PIML Waldron (engineered features)",
-    }
-    demo_options = [k for k in DEMO_DATASETS if k not in HIDDEN_DEMOS]
-    # Guard against a stale widget value from before a demo was hidden (e.g.
-    # a browser tab left open across a code change) -- st.selectbox raises if
-    # the stored session-state value isn't in the new options list.
-    if st.session_state.get("demo_dataset_select") in HIDDEN_DEMOS:
-        del st.session_state["demo_dataset_select"]
+    demo_options = list(DEMO_DATASETS)
 
     st.header("1. Dataset")
     source = st.radio(
