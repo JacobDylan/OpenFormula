@@ -1,0 +1,44 @@
+{
+  "@context": "https://doi.org/10.5063/schema/codemeta-2.0",
+  "@type": "SoftwareSourceCode",
+  "name": "OpenFormula",
+  "description": "OpenFormula is a physics-informed symbolic regression tool built for engineers and researchers who want interpretable, closed-form equations instead of black-box predictions. At its core, it uses Gene Expression Programming (GEP), an evolutionary algorithm that evolves populations of candidate mathematical expressions over many generations, selecting for accuracy while keeping the resulting formulas short and human-readable. This makes it well suited to domains like structural and materials engineering, where a usable result needs to be an equation that can be checked against known physics, not just a prediction. A key feature is the ability to combine a known, literature-based formula with a GEP-discovered correction term, either additively (physics plus a learned residual) or multiplicatively (physics times a learned fractional correction). This lets users start from an established code equation and let the search focus only on what that equation is missing, rather than rediscovering it from scratch. The tool ships with several built-in demo datasets and matching formulas from civil engineering codes and literature, including ACI 318 and CSA A23.3 shear and punching shear provisions, corrosion-reduced flexural capacity, lap splice bond strength, and cement and concrete strength models, so new users can explore the workflow immediately without supplying their own data. Beyond single runs, OpenFormula can sweep across multiple random seeds and varying levels of training data availability, which is useful for understanding how equation quality and stability change as less data becomes available, a common concern in real engineering datasets. Users can upload their own spreadsheet or CSV data, select target and feature columns, configure every GEP search setting (population size, generations, gene structure, tournament size, and more), and download a complete HTML report documenting the discovered formula, fit statistics, plots, and every hyperparameter used, so results are fully reproducible.",
+  "license": "https://spdx.org/licenses/BSD-3-Clause",
+  "codeRepository": "https://github.com/JacobDylan/OpenFormula",
+  "dateCreated": "2026-11-11",
+  "dateModified": "2026-11-11",
+  "datePublished": "2026-11-11",
+  "version": "1.0.0",
+  "programmingLanguage": {
+    "@type": "ComputerLanguage",
+    "name": "Python",
+    "url": "https://www.python.org"
+  },
+  "runtimePlatform": "Python 3",
+  "operatingSystem": [
+    "Linux",
+    "Windows",
+    "macOS"
+  ],
+  "applicationCategory": "Scientific/Engineering",
+  "keywords": [
+    "symbolic regression",
+    "gene expression programming",
+    "genetic programming",
+    "physics-informed machine learning",
+    "structural engineering",
+    "materials engineering",
+    "feature discovery",
+    "equation discovery",
+    "interpretable machine learning"
+  ],
+  "author": [
+    {
+      "@type": "Person",
+      "givenName": "Jacob",
+      "familyName": "Murphy"
+    }
+  ],
+  "softwareRequirements": "See requirements.txt (Python 3, streamlit, numpy, pandas, scikit-learn, sympy, deap, geppy, openpyxl, matplotlib, plotly)",
+  "readme": "https://github.com/JacobDylan/OpenFormula/blob/main/README.md"
+}

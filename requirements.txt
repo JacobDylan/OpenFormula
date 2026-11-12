@@ -1,0 +1,13 @@
+# Pinned below 71+ because newer setuptools dropped pkg_resources, which
+# geppy imports at load time.
+setuptools==70.3.0
+deap==1.4.4
+geppy==0.1.3
+numpy==2.5.1
+pandas==3.0.3
+scikit-learn==1.9.0
+sympy==1.14.0
+openpyxl==3.1.5
+streamlit==1.60.0
+matplotlib==3.11.1
+plotly==7.1.0
