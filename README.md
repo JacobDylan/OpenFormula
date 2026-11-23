@@ -68,7 +68,9 @@ or just run `./run_app.sh` (Linux/macOS) / double-click `run_app.bat`
 Then in the browser:
 
 1. **Dataset** — upload your own `.csv`/`.xlsx` file, or pick one of the
-   built-in demo datasets to try it out immediately (see below).
+   built-in demo datasets to try it out immediately (see below). If your
+   rows come from several source studies, turn on **study-aware runs** and
+   pick the study-ID column (see [Study-aware mode](#study-aware-mode)).
 2. **Response & feature variables** — pick the target column and the
    candidate feature columns. Non-numeric columns are flagged and you'll
    be prompted to one-hot encode or drop them.
@@ -81,9 +83,10 @@ Then in the browser:
    (`physics * (1 + GEP(x))`) combination mode. Leave the formula blank to
    have GEP fit the target directly.
 4. **Search settings** — equation complexity (head length / number of
-   genes), generations, population size, tournament size, Hall-of-Fame
-   size, the training-data-availability sweep (e.g. `0.05, 0.1, 0.25, 0.5`),
-   and how many random seeds to run per level.
+   genes), generations, population size, tournament size, number of elites
+   carried unchanged between generations (default 3), Hall-of-Fame size,
+   the training-data-availability sweep (e.g. `0.05, 0.1, 0.25, 0.5`), and
+   how many random seeds to run per level.
 5. **Run search** — progress and a live ETA are shown as it works through
    every seed × training-level combination.
 6. **Results** — ranked term/interaction tables, predicted-vs-actual plots
@@ -91,7 +94,13 @@ Then in the browser:
    baseline), equation-building tools (OLS/Ridge regression on the
    discovered terms, or hand-picking your own), and a downloadable HTML
    report documenting the dataset, formulas, fit statistics, plots, and
-   every hyperparameter actually used in that run.
+   every hyperparameter actually used in that run. The report also lists
+   every detected interaction term and feature (share of all solutions, of
+   accepted solutions, and at each training level) and embeds a CSV of
+   every recorded final equation with its R² values. You can optionally
+   upload a separate **external test set** in the report tab: it is used
+   nowhere else, and every final equation, the physics formula, each top
+   term and the combined equation are scored on it in the report.
 
 Note: column names that aren't valid Python identifiers (e.g. `a/d`,
 `f'c`) are automatically mapped to safe names — use the mapping shown in
@@ -113,8 +122,32 @@ python parse_terms.py --in results/sweep_results.csv \
 ```
 
 `run_sweep.py --help` lists every knob (equation complexity, tournament
-size, Hall-of-Fame size, validation fraction, etc). Results are appended to
-the CSV after every run, so an interrupted sweep loses nothing.
+size, `--elites`, Hall-of-Fame size, validation fraction, `--group-col`
+for study-aware splits, etc). Results are appended to the CSV after every
+run, so an interrupted sweep loses nothing (use `--fresh` or a new `--out`
+file when the column set changes between versions).
+
+## Study-aware mode
+
+When a dataset pools specimens from many test programs, a random row split
+lets the same study appear in both training and validation, which
+overstates how well an equation generalizes. Study-aware mode (the toggle
+in step 1, or `--group-col` on the CLI) splits by whole studies instead:
+
+- Each training level is a fraction of all rows. Each seed shuffles the
+  study IDs and adds whole studies to training until the next one would
+  overshoot the target; a random subset of that next study fills the
+  target exactly, and the rest of that study is left out of the run.
+  Every remaining study is validation, so no study is in both.
+- If a shuffle would leave no validation study (e.g. one very large study
+  drawn last at a high training level), the next shuffle from the same
+  seed is used; `n_reshuffles` records this, and runs stay reproducible.
+- GEP still evolves on training MAE. Each run's final solution is the
+  recorded one with the highest R² on its training + validation studies,
+  and the results' R² gate is applied to those run winners.
+- There is no internal test set in this mode; use the report's external
+  test set upload for a truly independent check.
+- The equation-building regression fit also holds out whole studies.
 
 ## Built-in demo datasets
 
@@ -140,7 +173,9 @@ to "(none / custom)" to have GEP fit the target directly.
 - **Results tab** — ranked term/interaction tables, auto-generated
   predicted-vs-actual plots for the top recurring terms, a breakdown of
   which input ranges the model can actually be trusted over, and one-click
-  CSV downloads of the raw results, ranked main effects, and ranked terms.
+  CSV downloads of the raw results, ranked main effects, ranked terms,
+  term/feature presence (all / accepted / per training level), and every
+  final equation with its R² values.
 - **Equation building tab** — turn the discovered terms into an actual
   usable equation: fit a proper held-out-tested weighted regression (OLS
   or Ridge) combining the physics baseline with the top terms, or

@@ -31,8 +31,12 @@ DEFAULT_PTRAINS = [0.05, 0.10, 0.15, 0.25, 0.50, 0.75]
 
 FIELDNAMES = [
     "seed", "ptrain", "rank", "n_train", "n_val", "n_test",
-    "train_mae", "val_mae", "val_r2", "trainval_r2", "test_mae", "test_rmse", "test_r2", "expr",
+    "train_mae", "train_r2", "val_mae", "val_r2", "trainval_r2", "test_mae", "test_rmse", "test_r2", "expr",
     "combine_mode", "n_physics_clipped",
+    # Study-aware split details (blank when split_mode == "random").
+    "split_mode", "n_train_studies", "n_val_studies", "train_studies",
+    "partial_study", "n_partial_taken", "n_partial_dropped", "val_studies",
+    "n_reshuffles", "best_in_run",
 ]
 
 
@@ -62,7 +66,7 @@ def parse_str_list(s):
 def sweep(
     df, feature_names, target_name, seeds, ptrains,
     physics_formula=None, combine_mode="add", generations=750, pop_size=100, head_length=2,
-    n_genes=2, tournsize=5, champs=3, val_frac_of_pool=0.15, verbose=False,
+    n_genes=2, tournsize=5, champs=3, n_elites=3, val_frac_of_pool=0.15, group_col=None, verbose=False,
 ):
     """Generator yielding one dict per completed (seed, ptrain) run:
     {done, total, seed, ptrain, dt, records}. The caller is responsible for
@@ -72,7 +76,11 @@ def sweep(
     `combine_mode` ("add" or "mult") controls how physics and GEP's
     discovered term are combined -- see gep_core.combine_physics(). It's a
     single whole-sweep setting (not per seed/ptrain), matching how
-    `physics_formula` itself is already handled."""
+    `physics_formula` itself is already handled.
+
+    `group_col`, if given, switches every run to the study-aware split (see
+    gep_core.split_data_by_study): each seed picks whole training studies,
+    every other study validates, and there is no test set."""
     total = len(seeds) * len(ptrains)
     done = 0
     for ptrain in ptrains:
@@ -83,8 +91,8 @@ def sweep(
                 seed=seed, ptrain=ptrain, physics_formula=physics_formula,
                 combine_mode=combine_mode,
                 generations=generations, pop_size=pop_size, head_length=head_length,
-                n_genes=n_genes, tournsize=tournsize, champs=champs,
-                val_frac_of_pool=val_frac_of_pool, verbose=verbose,
+                n_genes=n_genes, tournsize=tournsize, champs=champs, n_elites=n_elites,
+                val_frac_of_pool=val_frac_of_pool, group_col=group_col, verbose=verbose,
             )
             done += 1
             dt = time.time() - t0
@@ -113,15 +121,21 @@ def main():
     ap.add_argument("--n-genes", type=int, default=2, help="equation complexity: number of gene modules summed together")
     ap.add_argument("--tournsize", type=int, default=5)
     ap.add_argument("--champs", type=int, default=3, help="Hall-of-Fame size (solutions recorded per run)")
+    ap.add_argument("--elites", type=int, default=3,
+                     help="number of best individuals copied unchanged into each next generation")
     ap.add_argument("--val-frac", type=float, default=0.15,
                      help="fraction of each run's train+val pool held out to score/rank candidates during the search")
+    ap.add_argument("--group-col", default=None,
+                     help="study-ID column; if given, split train/validation by whole studies "
+                          "(--ptrains become fractions of the whole file used for training, every "
+                          "other study validates, no test set, --val-frac is ignored)")
     ap.add_argument("--fresh", action="store_true", help="overwrite --out instead of appending")
     ap.add_argument("--verbose", action="store_true", help="print gep_simple generation logs")
     args = ap.parse_args()
 
     df = load_dataset(args.data)
     target_name = args.target or df.columns[-1]
-    feature_names_raw = args.features or [c for c in df.columns if c != target_name]
+    feature_names_raw = args.features or [c for c in df.columns if c not in (target_name, args.group_col)]
 
     # GEP/sympy symbol names must be valid, non-keyword Python identifiers;
     # real spreadsheet headers (e.g. "a/d") often aren't, so sanitize.
@@ -159,16 +173,23 @@ def main():
             df, feature_names, target_name, args.seeds, args.ptrains,
             physics_formula=args.physics, combine_mode=args.combine_mode, generations=args.generations,
             pop_size=args.pop_size, head_length=args.head_length,
-            n_genes=args.n_genes, tournsize=args.tournsize, champs=args.champs,
-            val_frac_of_pool=args.val_frac, verbose=args.verbose,
+            n_genes=args.n_genes, tournsize=args.tournsize, champs=args.champs, n_elites=args.elites,
+            val_frac_of_pool=args.val_frac, group_col=args.group_col, verbose=args.verbose,
         ):
             for rec in progress["records"]:
                 writer.writerow(rec)
             f.flush()
-            best = progress["records"][0]
+            # Study mode: report the run's final best (highest train+val R²);
+            # random mode: the Hall-of-Fame leader (lowest training MAE).
+            best = next((r for r in progress["records"] if r.get("best_in_run") is True),
+                        progress["records"][0])
+            score = (
+                f"val_r2={best['val_r2']:.3f} val_mae={best['val_mae']:.2f}" if args.group_col
+                else f"test_r2={best['test_r2']:.3f} test_mae={best['test_mae']:.2f}"
+            )
             print(
                 f"[{progress['done']}/{progress['total']}] seed={progress['seed']} ptrain={progress['ptrain']} "
-                f"({progress['dt']:.1f}s) test_r2={best['test_r2']:.3f} test_mae={best['test_mae']:.2f} expr={best['expr']}"
+                f"({progress['dt']:.1f}s) {score} expr={best['expr']}"
             )
 
     print(f"Done in {time.time()-t_start:.1f}s. Results written to {args.out}")

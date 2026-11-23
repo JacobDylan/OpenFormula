@@ -378,6 +378,137 @@ def split_data(df, feature_names, target_name, ptrain, seed, val_frac_of_pool=0.
     )
 
 
+def split_data_by_study(df, feature_names, target_name, group_col, ptrain, seed):
+    """
+    Study-aware split: training and validation never share a study.
+
+    ptrain: fraction of the WHOLE loaded dataset (the development pool) to
+    use for training -- target size n_target = round(ptrain * n_rows).
+    The study IDs in `group_col` are shuffled with `seed`, then whole
+    studies are added to training until the next one would overshoot
+    n_target. To hit n_target exactly, a random subset of that next study's
+    rows is taken and the rest of that study is dropped from this run, so
+    no study is ever split between training and validation. Every remaining
+    study is validation. There is no test set (test arrays are empty).
+
+    Returns the same keys as split_data(), plus `study_info` describing
+    which studies went where.
+    """
+    X = df[feature_names].to_numpy(dtype=float)
+    y = df[target_name].to_numpy(dtype=float)
+    train_idx, val_idx, study_info = study_split_indices(df[group_col].to_numpy(), ptrain, seed)
+    empty_X = np.empty((0, X.shape[1]))
+    return dict(
+        X_train=X[train_idx], y_train=y[train_idx],
+        X_val=X[val_idx], y_val=y[val_idx],
+        X_test=empty_X, y_test=np.empty(0),
+        X_whole=X, y_whole=y,
+        study_info=study_info,
+    )
+
+
+def study_split_indices(groups, ptrain, seed):
+    """Row indices for the study-aware rule described in
+    split_data_by_study(): (train_idx, held_out_idx, study_info), where
+    held_out_idx is every row of every study not touched by training (the
+    partial study's leftover rows are in neither).
+
+    If a shuffle leaves fewer than 2 held-out rows (e.g. a very large study
+    lands last at a high training fraction, so every other study plus a
+    sliver of it fills training), the next shuffle from the same seeded RNG
+    is used instead, until one leaves a validation set. This stays fully
+    reproducible per seed; `n_reshuffles` in the returned info says how many
+    orderings were rejected (0 almost always). Raises ValueError only if no
+    ordering can leave 2 held-out rows at this training fraction."""
+    groups = np.asarray(groups)
+    n = len(groups)
+
+    n_target = max(1, int(round(ptrain * n)))
+    rng = np.random.RandomState(seed)
+    # Sort first so the shuffle depends only on the seed and the set of
+    # study IDs, not on the row order of the file.
+    study_ids = sorted(pd.unique(groups), key=lambda s: (str(type(s)), s))
+    rows_of = {s: np.flatnonzero(groups == s) for s in study_ids}
+
+    # Some ordering leaves >= 2 validation rows iff some study with >= 2 rows
+    # can sit entirely outside training, i.e. the other studies alone can
+    # cover n_target. Check up front so we never loop on an impossible split.
+    if not any(len(r) >= 2 and n - len(r) >= n_target for r in rows_of.values()):
+        raise ValueError(
+            f"Study split at training level {ptrain:g} cannot leave a validation study: "
+            f"{n_target} training rows are needed, so no study could be held out whole. "
+            f"Use a smaller training fraction."
+        )
+
+    max_reshuffles = 10_000
+    for n_reshuffles in range(max_reshuffles + 1):
+        order = rng.permutation(len(study_ids))
+        shuffled = [study_ids[i] for i in order]
+
+        train_idx = []
+        train_studies = []
+        partial_study = None
+        n_partial_taken = 0
+        n_partial_dropped = 0
+        pos = 0
+        while pos < len(shuffled):
+            s = shuffled[pos]
+            size = len(rows_of[s])
+            if len(train_idx) + size <= n_target:
+                train_idx.extend(rows_of[s])
+                train_studies.append(s)
+                pos += 1
+                if len(train_idx) == n_target:
+                    break
+            else:
+                need = n_target - len(train_idx)
+                take = rng.choice(rows_of[s], size=need, replace=False)
+                train_idx.extend(take)
+                partial_study = s
+                n_partial_taken = need
+                n_partial_dropped = size - need
+                pos += 1
+                break
+        val_studies = shuffled[pos:]
+        n_val = sum(len(rows_of[s]) for s in val_studies)
+        if n_val >= 2:
+            break
+    else:
+        raise ValueError(
+            f"Study split at training level {ptrain:g} (seed {seed}): no shuffle in "
+            f"{max_reshuffles} tries left a validation set. Use a smaller training fraction."
+        )
+
+    val_idx = np.concatenate([rows_of[s] for s in val_studies])
+    train_idx = np.sort(np.asarray(train_idx, dtype=int))
+    val_idx = np.sort(val_idx.astype(int))
+    return train_idx, val_idx, dict(
+        train_studies=train_studies,
+        partial_study=partial_study,
+        n_partial_taken=n_partial_taken,
+        n_partial_dropped=n_partial_dropped,
+        val_studies=list(val_studies),
+        n_reshuffles=n_reshuffles,
+    )
+
+
+def best_in_run_mask(results):
+    """Boolean mask (aligned with `results`, a DataFrame of run records)
+    marking each run's final best solution: within each (seed, ptrain) run,
+    the recorded Hall-of-Fame member with the highest R² on the run's
+    train+validation rows (`trainval_r2`). Ties go to the earlier record,
+    i.e. the lower Hall-of-Fame rank (lower training MAE); a NaN R² never
+    wins unless the whole run is NaN."""
+    df = pd.DataFrame(results).reset_index(drop=True)
+    mask = np.zeros(len(df), dtype=bool)
+    if not len(df):
+        return mask
+    score = pd.to_numeric(df["trainval_r2"], errors="coerce").fillna(-np.inf)
+    winners = score.groupby([df["seed"], df["ptrain"]], sort=False).idxmax()
+    mask[winners.to_numpy()] = True
+    return mask
+
+
 def _cols(X):
     """Split a (n, n_features) array into a list of 1D column arrays, matching
     the calling convention `func(*cols)` expected by geppy-compiled individuals
@@ -402,8 +533,10 @@ def run_single(
     n_genes=2,
     tournsize=5,
     champs=3,
+    n_elites=3,
     rnc_array_length=10,
     val_frac_of_pool=0.15,
+    group_col=None,
     verbose=False,
 ):
     """Run one GEP evolution for a given seed & training-data-availability
@@ -411,12 +544,24 @@ def run_single(
     physics(features) -- either additively (target - physics, the default)
     or multiplicatively (target / physics - 1, if combine_mode="mult"; GEP
     then evolves a fractional correction rather than the residual itself).
+
+    If `group_col` is given, the data is split by whole studies instead
+    (see split_data_by_study): `ptrain` is then the training fraction of the
+    whole loaded dataset, every other study is validation, `val_frac_of_pool`
+    is ignored, and there is no test set (test metrics are NaN).
+
     Returns a list of result dicts, one per Hall-of-Fame individual
     (rank 1 = best)."""
-    split = split_data(
-        df, feature_names, target_name, ptrain=ptrain, seed=seed,
-        val_frac_of_pool=val_frac_of_pool,
-    )
+    if group_col is not None:
+        split = split_data_by_study(
+            df, feature_names, target_name, group_col, ptrain=ptrain, seed=seed,
+        )
+    else:
+        split = split_data(
+            df, feature_names, target_name, ptrain=ptrain, seed=seed,
+            val_frac_of_pool=val_frac_of_pool,
+        )
+    has_test = len(split["y_test"]) > 0
 
     # Seed all stochastic GEP machinery (population init, mutation, crossover,
     # tournament selection) from the same seed used for the data split.
@@ -496,10 +641,37 @@ def run_single(
     pop = toolbox.population(n=pop_size)
     hof = tools.HallOfFame(champs)
 
+    # Elitism: the n_elites best individuals are copied unchanged into the
+    # next generation; the rest of the population is filled by selection +
+    # mutation/crossover as usual.
+    if not 0 <= int(n_elites) < pop_size:
+        raise ValueError(f"Number of elites ({n_elites}) must be at least 0 and less than the population size ({pop_size}).")
     _, _ = gep.gep_simple(
-        pop, toolbox, n_generations=generations, n_elites=1,
+        pop, toolbox, n_generations=generations, n_elites=int(n_elites),
         stats=stats, hall_of_fame=hof, verbose=verbose,
     )
+
+    # Logged on every record (blank in random-split mode) so a saved results
+    # CSV is enough to reconstruct exactly which studies each run used.
+    info = split.get("study_info")
+    if info is not None:
+        study_fields = dict(
+            split_mode="study",
+            n_train_studies=len(info["train_studies"]) + (1 if info["partial_study"] is not None else 0),
+            n_val_studies=len(info["val_studies"]),
+            train_studies=";".join(str(s) for s in info["train_studies"]),
+            partial_study="" if info["partial_study"] is None else str(info["partial_study"]),
+            n_partial_taken=info["n_partial_taken"],
+            n_partial_dropped=info["n_partial_dropped"],
+            val_studies=";".join(str(s) for s in info["val_studies"]),
+            n_reshuffles=info["n_reshuffles"],
+        )
+    else:
+        study_fields = dict(
+            split_mode="random", n_train_studies="", n_val_studies="", train_studies="",
+            partial_study="", n_partial_taken="", n_partial_dropped="", val_studies="",
+            n_reshuffles="",
+        )
 
     records = []
     for rank, ind in enumerate(hof, start=1):
@@ -507,7 +679,13 @@ def run_single(
 
         yp_train = combine_physics(phys_train, np.array(list(map(func, *X_train_cols))), combine_mode)
         yp_val = combine_physics(phys_val, np.array(list(map(func, *X_val_cols))), combine_mode)
-        yp_test = combine_physics(phys_test, np.array(list(map(func, *X_test_cols))), combine_mode)
+        if has_test:
+            yp_test = combine_physics(phys_test, np.array(list(map(func, *X_test_cols))), combine_mode)
+            test_mae = mean_absolute_error(y_test, yp_test)
+            test_rmse = mean_squared_error(y_test, yp_test) ** 0.5
+            test_r2 = r2_score(y_test, yp_test)
+        else:
+            test_mae = test_rmse = test_r2 = float("nan")
 
         # R² over the whole train+val pool (the data this individual was fit
         # and scored against during the search, combined) -- as opposed to
@@ -527,15 +705,23 @@ def run_single(
             n_val=len(y_val),
             n_test=len(y_test),
             train_mae=mean_absolute_error(y_train, yp_train),
+            train_r2=r2_score(y_train, yp_train),
             val_mae=mean_absolute_error(y_val, yp_val),
             val_r2=r2_score(y_val, yp_val),
             trainval_r2=r2_score(y_trainval, yp_trainval),
-            test_mae=mean_absolute_error(y_test, yp_test),
-            test_rmse=mean_squared_error(y_test, yp_test) ** 0.5,
-            test_r2=r2_score(y_test, yp_test),
+            test_mae=test_mae,
+            test_rmse=test_rmse,
+            test_r2=test_r2,
             expr=str(expr),
             combine_mode=combine_mode,
             n_physics_clipped=n_physics_clipped,
+            **study_fields,
         ))
+
+    # Study mode: flag the run's final best solution (highest train+val R²).
+    # Blank in random-split mode, where runs are not reduced to one winner.
+    best = best_in_run_mask(records) if info is not None else None
+    for i, rec in enumerate(records):
+        rec["best_in_run"] = bool(best[i]) if best is not None else ""
 
     return records

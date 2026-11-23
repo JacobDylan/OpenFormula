@@ -29,10 +29,19 @@ from sklearn.model_selection import train_test_split
 
 from gep_core import (
     FormulaError, clip_physics_for_mult, combine_physics, load_dataset, make_physics_fn,
-    physics_clip_eps, sanitize_feature_names, validate_formula,
+    best_in_run_mask, physics_clip_eps, sanitize_feature_names, study_split_indices, validate_formula,
 )
-from parse_terms import describe_term, parse_results_df, term_expr_string
+from parse_terms import (
+    describe_term, parse_expressions, parse_results_df, presence_stats, term_expr_string,
+)
 from run_sweep import parse_float_list, parse_int_list, sweep
+
+
+@st.cache_data(show_spinner=False)
+def _parse_exprs_cached(exprs):
+    """sympy-parse every recorded solution once per results set (not on every
+    widget rerun) for the presence-stats tables."""
+    return parse_expressions(exprs)
 
 st.set_page_config(page_title="OpenFormula", layout="wide")
 
@@ -326,6 +335,99 @@ def _combine_formula_str(physics_str, correction_str, combine_mode):
     return f"{physics_str} + {correction_str}"
 
 
+def _final_equations_table(results_df, accepted_mask, gate_col, gate_min, physics_formula, combine_mode,
+                           best_in_run=None):
+    """One row per recorded solution (every Hall-of-Fame member of every
+    seed x training level run), with the complete final equation -- physics
+    combined with that solution's GEP term, written with plain * and + so
+    it can be pasted back into code -- plus its R²/error metrics and whether
+    it was accepted by the R² gate. Meant for post-processing, e.g. R²
+    ranges per training level."""
+    df = results_df.copy()
+    exprs = df["expr"].astype(str)
+    if physics_formula:
+        if combine_mode == "mult":
+            final = [f"({physics_formula}) * (1 + ({e}))" for e in exprs]
+        else:
+            final = [f"{physics_formula} + ({e})" for e in exprs]
+    else:
+        final = ["0" if combine_mode == "mult" else e for e in exprs]
+    df["final_equation"] = final
+    df["gep_term"] = exprs
+    df["accepted"] = np.asarray(accepted_mask, dtype=bool)
+    if best_in_run is not None:
+        # Study mode: the run's final best solution (highest train+val R²);
+        # only these can be accepted.
+        df["best_in_run"] = np.asarray(best_in_run, dtype=bool)
+    elif "best_in_run" in df.columns:
+        df = df.drop(columns=["best_in_run"])
+    if gate_col in df.columns:
+        # accepted also includes each level's single best solution kept when
+        # nothing at that level clears the gate; passes_r2_gate is the raw test.
+        df["passes_r2_gate"] = df[gate_col] >= gate_min
+
+    lead = ["seed", "ptrain", "rank", "best_in_run", "accepted", "passes_r2_gate", "final_equation", "gep_term",
+            "combine_mode", "n_train", "n_val", "n_test",
+            "train_r2", "val_r2", "trainval_r2", "test_r2",
+            "train_mae", "val_mae", "test_mae", "test_rmse", "n_physics_clipped"]
+    study = ["split_mode", "n_train_studies", "n_val_studies", "train_studies", "partial_study",
+             "n_partial_taken", "n_partial_dropped", "n_reshuffles", "val_studies"]
+    cols = [c for c in lead + study if c in df.columns]
+    df = df[cols]
+    if (df.get("split_mode") == "study").all():
+        # No test set in study mode -- drop the always-empty test columns.
+        df = df.drop(columns=[c for c in ("n_test", "test_r2", "test_mae", "test_rmse") if c in df.columns])
+    else:
+        df = df.drop(columns=[c for c in study[1:] if c in df.columns])
+    sort_cols = [c for c in ("ptrain", "seed", "rank") if c in df.columns]
+    return df.sort_values(sort_cols, kind="stable").reset_index(drop=True)
+
+
+def _prepare_external_test(df_t, prep, feature_names, target_name):
+    """Put an uploaded external test set through the same column steps the
+    development data went through before the search (demo header renames,
+    one-hot encoding, safe feature names) and keep just the features +
+    target. Returns (test_df, n_rows_dropped_for_missing_values). Raises
+    ValueError naming any required column the file lacks."""
+    prep = prep or {}
+    df_t = df_t.copy()
+    if prep.get("rename"):
+        df_t = df_t.rename(columns=prep["rename"])
+    for col in prep.get("encode_cols", []):
+        if col in df_t.columns:
+            dummies = pd.get_dummies(df_t[col], prefix=col, dtype=int)
+            df_t = pd.concat([df_t.drop(columns=[col]), dummies], axis=1)
+    df_t = df_t.rename(columns=prep.get("name_map", {}))
+    for c in prep.get("dummy_cols", []):
+        # A category absent from the test file is simply all-zero there.
+        if c not in df_t.columns and c in feature_names:
+            df_t[c] = 0
+    needed = list(feature_names) + [target_name]
+    missing = [c for c in needed if c not in df_t.columns]
+    if missing:
+        inv = {v: k for k, v in prep.get("name_map", {}).items()}
+        raise ValueError(
+            "The test set is missing column(s): "
+            + ", ".join(f"`{inv.get(c, c)}`" for c in missing)
+            + ". It needs the same columns as the development data."
+        )
+    sub = df_t[needed].apply(pd.to_numeric, errors="coerce")
+    bad = sub.isna().any(axis=1)
+    return sub[~bad].reset_index(drop=True), int(bad.sum())
+
+
+def _safe_stats(y_true, formula, feature_names, X):
+    """_regression_stats() for a formula string evaluated on X, or None if
+    the formula can't be evaluated there."""
+    try:
+        pred = make_physics_fn(formula, feature_names)(X)
+        if not np.all(np.isfinite(pred)):
+            return None
+        return _regression_stats(y_true, pred)
+    except Exception:
+        return None
+
+
 def gep_equation(label_html, equation_text):
     """A slightly larger, greener call-out box for a generated equation,
     with the equation itself set in the same serif face (not code font)
@@ -509,7 +611,8 @@ def _prettify_ascii_expr(s):
 
 def _build_report_html(physics_formula, known_formula_name, combo_formula, custom_equation,
                         phys_stats, fit_stats, plot_b64, top_terms_info, term_plots_info,
-                        data_table, target_name, dataset_label, feature_names, hyperparams):
+                        data_table, target_name, dataset_label, feature_names, hyperparams,
+                        presence=None, gate_label="R² gate", final_equations=None, test_eval=None):
     """Assemble the full downloadable HTML report string: a title/timestamp
     header (with the dataset name and feature space), the physics formula
     (with its known-formula name if one was picked), the original unfitted
@@ -539,6 +642,114 @@ def _build_report_html(physics_formula, known_formula_name, combo_formula, custo
     ) or "<tr><td colspan='4'><em>(none)</em></td></tr>"
 
     data_table_html = data_table.to_html(index=False, float_format=lambda x: f"{x:.4g}")
+
+    # Every detected term and feature (not just the ones used in the formula):
+    # presence across all solutions, accepted solutions, and per level.
+    def _presence_table_html(df_in, label_col, show_nvars):
+        if presence is None or df_in is None or not len(df_in):
+            return "<p><em>(none)</em></p>"
+        levels = presence["levels"]
+        head = (
+            f"<tr><th>{label_col.capitalize()}</th>"
+            + ("<th># vars</th>" if show_nvars else "")
+            + "<th>All solutions</th><th>Accepted</th>"
+            + "".join(f"<th>{p * 100:g}% training</th>" for p in levels)
+            + "</tr>"
+        )
+        body = []
+        for _, r in df_in.iterrows():
+            cells = [f"<td>{r[label_col]}</td>"]
+            if show_nvars:
+                cells.append(f"<td>{int(r['n_variables'])}</td>")
+            cells.append(f"<td>{int(r['n_all'])} ({r['pct_all']:.1f}%)</td>")
+            cells.append(f"<td>{int(r['n_accepted'])} ({r['pct_accepted']:.1f}%)</td>")
+            for p in levels:
+                cells.append(
+                    f"<td>{int(r[f'n_accepted_ptrain_{p:g}'])} ({r[f'pct_accepted_ptrain_{p:g}']:.1f}%)</td>"
+                )
+            body.append("<tr>" + "".join(cells) + "</tr>")
+        return f'<div class="data-table-wrap"><table>{head}{"".join(body)}</table></div>'
+
+    if presence is not None:
+        _lvl_denoms = ", ".join(
+            f"{p * 100:g}%: {presence['n_accepted_by_level'][p]} of {presence['n_all_by_level'][p]}"
+            for p in presence["levels"]
+        )
+        presence_intro_html = (
+            f"<p>Every term and feature found in any recorded solution. <strong>All solutions</strong> "
+            f"= count (and %) of all {presence['n_all']} recorded solutions containing it. "
+            f"<strong>Accepted</strong> = count (and %) of the {presence['n_accepted']} solutions past "
+            f"the {gate_label} gate. Each <strong>training-level</strong> column = count (and %) of "
+            f"that level's accepted solutions (accepted of all, per level: {_lvl_denoms}). A "
+            f"term/feature counts at most once per solution. The terms table lists multi-variable "
+            f"interactions only; single variables are covered by the features table.</p>"
+        )
+        # Interactions only: single-variable terms are already covered by the
+        # features table below.
+        _tdf = presence["term_df"]
+        if _tdf is not None and len(_tdf) and "n_variables" in _tdf.columns:
+            _tdf = _tdf[_tdf["n_variables"] >= 2]
+        all_terms_html = _presence_table_html(_tdf, "term", True)
+        all_features_html = _presence_table_html(presence["feature_df"], "feature", False)
+    else:
+        presence_intro_html = "<p><em>(not available)</em></p>"
+        all_terms_html = all_features_html = ""
+
+    # Every recorded solution's complete final equation + metrics, as a table
+    # and as a CSV embedded in the report (data: URI) so it can be saved
+    # straight from the HTML file.
+    if final_equations is not None and len(final_equations):
+        _csv_b64 = base64.b64encode(final_equations.to_csv(index=False).encode("utf-8")).decode("ascii")
+        _show = [c for c in ("ptrain", "seed", "rank", "best_in_run", "accepted", "train_r2", "val_r2", "trainval_r2",
+                             "test_r2", "ext_test_r2", "final_equation") if c in final_equations.columns]
+        _tbl_html = final_equations[_show].rename(columns={"final_equation": "Final equation"}).to_html(
+            index=False, float_format=lambda x: f"{x:.4f}",
+        )
+        final_eq_html = (
+            f"<p>All {len(final_equations)} recorded solutions (every Hall-of-Fame member of every "
+            f"seed &times; training-level run), each written as its complete final equation (physics "
+            f"combined with that solution's GEP term). "
+            + (
+                "<strong>best_in_run</strong> = the run's final best solution (highest R² on its "
+                "train+validation studies); only these can be accepted. "
+                if "best_in_run" in final_equations.columns else ""
+            )
+            + f"<strong>accepted</strong> = kept by the "
+            f"{gate_label} gate. "
+            + (
+                f"<strong>ext_test_*</strong> = scored on the external test set "
+                f"(<code>{test_eval['label']}</code>, {test_eval['n']} rows); blank where an equation "
+                f"can't be evaluated there. "
+                if test_eval else ""
+            )
+            + f"The CSV also has error metrics, the GEP term on its own, and the "
+            f"split details.</p>"
+            f'<p><a download="final_equations.csv" href="data:text/csv;base64,{_csv_b64}">'
+            f"&#11015; Download final_equations.csv</a></p>"
+            f'<div class="data-table-wrap">'
+            f"{_tbl_html}</div>"
+        )
+    else:
+        final_eq_html = "<p><em>(not available)</em></p>"
+
+    if test_eval:
+        _t_rows = "".join(
+            f"<tr><td>{name}</td><td>{s['R2']:.4f}</td><td>{s['RMSE']:.4g}</td><td>{s['MAE']:.4g}</td>"
+            f"<td>{s['pct_conservative']:.1f}</td><td>{s['mean_error']:.4g}</td></tr>"
+            for name, s in test_eval["rows"]
+        )
+        test_section_html = f"""
+  <h2>External test set</h2>
+  <p>Scored on <code>{test_eval['label']}</code> ({test_eval['n']} rows), a separate file that the
+  search, the R² gate and the equation fitting never saw. Every recorded final equation's test
+  scores are in the final equations table and CSV below.</p>
+  <table>
+    <tr><th>Equation</th><th>R²</th><th>RMSE</th><th>MAE</th><th>% conservative (pred ≤ actual)</th><th>Mean error (pred − actual)</th></tr>
+    {_t_rows}
+  </table>
+"""
+    else:
+        test_section_html = ""
 
     term_sections_html = "".join(
         f"""
@@ -572,6 +783,7 @@ def _build_report_html(physics_formula, known_formula_name, combo_formula, custo
         return ", ".join(fmt.format(x) for x in xs) if xs else "(none)"
 
     hp = hyperparams or {}
+    _study = hp.get("split_mode") == "study"
     combine_mode_label = (
         "Multiplicative -- physics × (1 + GEP(X))" if hp.get("combine_mode") == "mult"
         else "Additive -- physics + GEP(X)"
@@ -585,11 +797,33 @@ def _build_report_html(physics_formula, known_formula_name, combo_formula, custo
             ("Population size per run", hp.get("pop_size", "—")),
             ("Tournament size", hp.get("tournsize", "—")),
             ("Hall-of-Fame size (solutions recorded per run)", hp.get("champs", "—")),
-            ("Validation fraction of train+val pool", hp.get("val_frac", "—")),
+            # Runs recorded before this was a setting always used 1 elite.
+            ("Number of elites between generations", hp.get("n_elites", 1)),
+            (
+                "Data split",
+                f"Study-aware: whole studies by <code>{hp.get('study_col')}</code>; each seed picks "
+                f"the training studies, every other study validates, no test set"
+                if _study else "Random rows (train / validation / held-out test)",
+            ),
+            (
+                "Validation fraction of train+val pool",
+                "not used (study-aware split)" if _study else hp.get("val_frac", "—"),
+            ),
             ("Combination mode", combine_mode_label),
             (
+                "Training-data-availability levels (fraction of the development pool used for training)"
+                if _study else
                 "Training-data-availability levels (ptrain, fraction of whole dataset)",
                 _fmt_list(hp.get("ptrains", []), "{:g}"),
+            ),
+            *(
+                [(
+                    f"Training specimens per level (of {hp['n_rows']})",
+                    _fmt_list(
+                        [f"{p:g} → {max(1, int(round(p * hp['n_rows'])))}" for p in hp.get("ptrains", [])]
+                    ),
+                )]
+                if _study and hp.get("n_rows") else []
             ),
             ("Number of random seeds", len(hp.get("seeds", []))),
             ("Random seeds", _fmt_list(hp.get("seeds", []))),
@@ -604,7 +838,6 @@ def _build_report_html(physics_formula, known_formula_name, combo_formula, custo
         for label, value in [
             ("Random numerical constant (RNC) array length per gene", "10"),
             ("Random numerical constant (RNC) range", "&minus;10 to 10, integer"),
-            ("Elitism (unconditionally-kept top individuals per generation)", "1"),
             ("Mutation -- uniform point mutation (per-element probability)", "0.05"),
             ("Mutation -- gene inversion probability", "0.1"),
             ("Mutation -- IS transposition probability", "0.1"),
@@ -674,14 +907,25 @@ def _build_report_html(physics_formula, known_formula_name, combo_formula, custo
     {stats_rows}
   </table>
 
+{test_section_html}
   <h2>True vs. predicted comparison</h2>
   <img src="data:image/png;base64,{plot_b64}" alt="True vs predicted comparison plot">
 
-  <h2>Top recurring terms</h2>
+  <h2>Top recurring terms (used in the formula)</h2>
   <table>
     <tr><th>Term</th><th># solutions</th><th>% of solutions</th><th>Description</th></tr>
     {terms_rows}
   </table>
+
+  <h2>All detected terms and features</h2>
+  {presence_intro_html}
+  <h3>Terms / interactions</h3>
+  {all_terms_html}
+  <h3>Features (anywhere in the expression)</h3>
+  {all_features_html}
+
+  <h2>Final equations (every recorded solution)</h2>
+  {final_eq_html}
 
   <h2>Individual feature/term performance (physics + one term at a time)</h2>
   <p>Each top term shown on its own, combined only with the physics baseline (not with the other terms) -- so its individual contribution can be judged in isolation, separate from the combined fitted equation above.</p>
@@ -736,6 +980,9 @@ with st.sidebar:
             ),
             "default_known_formula": "ACI 318 — Simplified one-way shear (Vc)",
         },
+        # `group_col` (optional): a study/source ID column. It is never offered
+        # as a feature or target, and is the default study column when
+        # study-aware runs are switched on in step 1.
         "Concrete mix strength (Yeh 1998)": {
             "file": "concrete_mix_strength.xlsx",
             "rename": {
@@ -916,8 +1163,59 @@ with st.sidebar:
     st.write(f"Loaded **{len(df_raw)}** rows, **{len(df_raw.columns)}** columns (duplicates dropped).")
     st.dataframe(df_raw.head(10), width="stretch")
 
-    numeric_cols = [c for c in df_raw.columns if pd.api.types.is_numeric_dtype(df_raw[c])]
-    non_numeric = [c for c in df_raw.columns if c not in numeric_cols]
+    # Study-aware runs (off by default, so the normal random split is
+    # unchanged): each run's seed picks whole studies for training and every
+    # other study validates -- see gep_core.split_data_by_study. The study
+    # column (and a demo's declared `group_col`, even with this off) is kept
+    # out of the target/feature lists, since it's an ID, not a measurement.
+    demo_group_col = DEMO_DATASETS[demo_choice].get("group_col") if demo_choice else None
+    if demo_group_col not in df_raw.columns:
+        demo_group_col = None
+    study_mode = st.toggle(
+        "Study-aware runs (split by whole studies)", value=False, key="study_mode",
+        help="Off: each run randomly splits rows into train/validation/test (the usual mode). "
+             "On: each run's seed shuffles the study IDs and adds whole studies to training until "
+             "the next one would overshoot the target size, then takes a random subset of that "
+             "next study to hit the target exactly (the rest of that study is dropped from the "
+             "run). Every remaining study is validation, so no study is ever in both. There is "
+             "no internal test set in this mode (an external one can be scored in the report). "
+             "Each run's final solution is its best by R² on train+validation studies, and the "
+             "R² gate in the results is applied to those run winners.",
+    )
+    study_col = None
+    if study_mode:
+        all_cols = list(df_raw.columns)
+        if st.session_state.get("study_col_select") not in all_cols:
+            st.session_state.pop("study_col_select", None)
+        default_study_col = demo_group_col or next(
+            (c for c in all_cols if "study" in str(c).lower()), all_cols[0]
+        )
+        study_col = st.selectbox(
+            "Study ID column", all_cols, index=all_cols.index(default_study_col),
+            key="study_col_select",
+            help="The column identifying which study (source/test program) each row came from.",
+        )
+        if df_raw[study_col].isna().any():
+            st.error(f"`{study_col}` has missing values -- every row needs a study ID.")
+            st.stop()
+        n_studies = df_raw[study_col].nunique()
+        if n_studies < 2:
+            st.error(f"`{study_col}` has only {n_studies} unique value -- need at least 2 studies.")
+            st.stop()
+        st.caption(
+            f"{n_studies} studies, {len(df_raw)} rows (median {int(df_raw[study_col].value_counts().median())} "
+            f"rows per study). `{study_col}` is used only for splitting, never as a feature."
+        )
+    id_cols = {c for c in (study_col, demo_group_col) if c is not None}
+
+    numeric_cols = [
+        c for c in df_raw.columns
+        if c not in id_cols and pd.api.types.is_numeric_dtype(df_raw[c])
+    ]
+    non_numeric = [c for c in df_raw.columns if c not in numeric_cols and c not in id_cols]
+    # Remembered at run time so an external test set (report tab) can be put
+    # through the same one-hot encoding as the development data.
+    encode_cols, dummy_cols_raw = [], []
 
     if non_numeric:
         st.warning(f"Non-numeric column(s) found: {non_numeric}. GEP needs numeric inputs -- "
@@ -945,6 +1243,7 @@ with st.sidebar:
         dummies_by_col = {}
         for col in encode_cols:
             dummies_by_col[col] = pd.get_dummies(df_raw[col], prefix=col, dtype=int)
+            dummy_cols_raw.extend(dummies_by_col[col].columns)
         if encode_cols:
             st.caption(
                 "One-hot encoded: " + "; ".join(
@@ -969,7 +1268,10 @@ with st.sidebar:
                 pieces.append(df_raw[[col]])
         df_raw = pd.concat(pieces, axis=1)
 
-        numeric_cols = [c for c in df_raw.columns if pd.api.types.is_numeric_dtype(df_raw[c])]
+        numeric_cols = [
+            c for c in df_raw.columns
+            if c not in id_cols and pd.api.types.is_numeric_dtype(df_raw[c])
+        ]
 
     if len(numeric_cols) < 2:
         st.error("Need at least 2 numeric columns (1 target + 1 feature).")
@@ -1562,6 +1864,18 @@ with st.sidebar:
             )
         with st.container(horizontal=True, vertical_alignment="center", gap="small"):
             st.markdown(
+                "Number of elites between generations",
+                help="How many of the best equations in each generation are copied unchanged into "
+                     "the next one, so the best solutions found so far are never lost to mutation "
+                     "or crossover. More elites = steadier progress but less exploration. "
+                     "Must be smaller than the population size.",
+            )
+            n_elites = st.number_input(
+                "Number of elites between generations", min_value=0, max_value=50, value=3,
+                label_visibility="collapsed", width=90, key="n_elites",
+            )
+        with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+            st.markdown(
                 "Hall-of-Fame size (solutions recorded per run)",
                 help="How many of the best *distinct* equations seen during a run are kept and "
                      "reported afterward, instead of only the single best one -- useful for "
@@ -1582,7 +1896,10 @@ with st.sidebar:
             val_frac = st.number_input(
                 "Validation fraction of train+val pool", min_value=0.05, max_value=0.4, value=0.15,
                 step=0.01, format="%.2f", label_visibility="collapsed", width=90,
+                disabled=study_mode,
             )
+        if study_mode:
+            st.caption("Not used in study-aware runs: every study not used for training is validation.")
 
 
     # --------------------------------------------------------------------------
@@ -1591,14 +1908,30 @@ with st.sidebar:
     st.header("5. Search design")
     c1, c2 = st.columns(2)
     with c1:
+        if study_mode:
+            ptrains_label = "Training-data-availability levels (fraction of the development pool used for training)"
+            ptrains_help = (
+                "Each value is the fraction of all loaded rows (the development pool) used to "
+                "train that level's runs, filled with whole studies picked by each run's seed. "
+                "Every study not used for training validates the run. The search is repeated "
+                "once per level, crossed with every seed below."
+            )
+        else:
+            ptrains_label = "Training-data-availability levels (fraction of whole dataset in train+val pool)"
+            ptrains_help = (
+                "Each value is a fraction of the *whole* dataset set aside as that level's "
+                "train+val pool (the rest becomes the held-out test set for scoring it). The "
+                "search is repeated once per level (crossed with every seed below), so you can "
+                "see which features/terms keep showing up even when there's very little "
+                "training data, versus ones that only emerge once plenty is available."
+            )
+        # Each mode's input has its own label (so its own widget state), so
+        # switching modes shows that mode's own default / last-typed levels.
         ptrains_str = st.text_input(
-            "Training-data-availability levels (fraction of whole dataset in train+val pool)",
-            value="0.05, 0.1, 0.15, 0.25, 0.5, 0.75",
-            help="Each value is a fraction of the *whole* dataset set aside as that level's "
-                 "train+val pool (the rest becomes the held-out test set for scoring it). The "
-                 "search is repeated once per level (crossed with every seed below), so you can "
-                 "see which features/terms keep showing up even when there's very little "
-                 "training data, versus ones that only emerge once plenty is available.",
+            ptrains_label,
+            value=("0.025, 0.05, 0.1, 0.2, 0.4, 0.6, 0.8" if study_mode
+                   else "0.05, 0.1, 0.15, 0.25, 0.5, 0.75"),
+            help=ptrains_help,
         )
         try:
             ptrains = parse_float_list(ptrains_str)
@@ -1606,6 +1939,11 @@ with st.sidebar:
         except Exception:
             st.error("Enter comma-separated fractions strictly between 0 and 1, e.g. 0.05, 0.1, 0.5")
             st.stop()
+        if study_mode:
+            st.caption(
+                f"Training specimens per level (of {len(df)}): "
+                + ", ".join(f"{p:g} → {max(1, int(round(p * len(df))))}" for p in ptrains)
+            )
     with c2:
         n_seeds = st.number_input(
             "Number of random seeds", min_value=1, max_value=200, value=10,
@@ -1641,29 +1979,43 @@ with st.sidebar:
         all_records = []
         t_start = time.time()
 
-        for prog in sweep(
-            df, feature_names, target_name, seeds, ptrains,
-            physics_formula=physics_formula, combine_mode=combine_mode,
-            generations=int(generations), pop_size=int(pop_size),
-            head_length=int(head_length), n_genes=int(n_genes), tournsize=int(tournsize),
-            champs=int(champs), val_frac_of_pool=float(val_frac), verbose=False,
-        ):
-            all_records.extend(prog["records"])
-            done, total = prog["done"], prog["total"]
-            elapsed = time.time() - t_start
-            eta = elapsed / done * (total - done)
-            progress_bar.progress(done / total, text=f"{done}/{total} runs complete")
-            with metrics_ph.container():
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Elapsed", f"{elapsed:.0f}s")
-                m2.metric("Avg time/run", f"{elapsed/done:.1f}s")
-                m3.metric("ETA remaining", f"{eta:.0f}s")
-            best = prog["records"][0]
-            with table_ph.container():
-                st.caption(
-                    f"Last: seed={prog['seed']} ptrain={prog['ptrain']} ({prog['dt']:.1f}s) "
-                    f"test_r2={best['test_r2']:.3f} test_mae={best['test_mae']:.2f} — `{best['expr']}`"
-                )
+        try:
+            for prog in sweep(
+                df, feature_names, target_name, seeds, ptrains,
+                physics_formula=physics_formula, combine_mode=combine_mode,
+                generations=int(generations), pop_size=int(pop_size),
+                head_length=int(head_length), n_genes=int(n_genes), tournsize=int(tournsize),
+                champs=int(champs), n_elites=int(n_elites), val_frac_of_pool=float(val_frac),
+                group_col=study_col, verbose=False,
+            ):
+                all_records.extend(prog["records"])
+                done, total = prog["done"], prog["total"]
+                elapsed = time.time() - t_start
+                eta = elapsed / done * (total - done)
+                progress_bar.progress(done / total, text=f"{done}/{total} runs complete")
+                with metrics_ph.container():
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Elapsed", f"{elapsed:.0f}s")
+                    m2.metric("Avg time/run", f"{elapsed/done:.1f}s")
+                    m3.metric("ETA remaining", f"{eta:.0f}s")
+                best = prog["records"][0]
+                if study_mode:
+                    score = (
+                        f"n_train={best['n_train']} ({best['n_train_studies']} studies), "
+                        f"val_r2={best['val_r2']:.3f} val_mae={best['val_mae']:.2f}"
+                        + (f", study order reshuffled {best['n_reshuffles']}x" if best.get("n_reshuffles") else "")
+                    )
+                else:
+                    score = f"test_r2={best['test_r2']:.3f} test_mae={best['test_mae']:.2f}"
+                with table_ph.container():
+                    st.caption(
+                        f"Last: seed={prog['seed']} ptrain={prog['ptrain']} ({prog['dt']:.1f}s) "
+                        f"{score} — `{best['expr']}`"
+                    )
+        except ValueError as e:
+            # e.g. a study-aware training level so high no validation study is left
+            st.error(f"Search stopped: {e}")
+            st.stop()
 
         st.session_state["results_df"] = pd.DataFrame(all_records)
         # Freeze everything the results section needs, so later widget changes
@@ -1677,6 +2029,18 @@ with st.sidebar:
         st.session_state["results_feature_names"] = list(feature_names)
         st.session_state["results_target_name"] = target_name
         st.session_state["results_data"] = df[feature_names + [target_name]].copy()
+        # Study ID per row (aligned with results_data), so the Equation
+        # building fit can hold out whole studies too. None = random-row mode.
+        st.session_state["results_groups"] = df[study_col].to_numpy() if study_mode else None
+        # How raw columns were turned into the features above (demo header
+        # renames, one-hot encoding, safe-name mapping), so an external test
+        # set uploaded in the report tab can be prepared the same way.
+        st.session_state["results_prep"] = {
+            "rename": dict(DEMO_DATASETS[demo_choice]["rename"]) if demo_choice else {},
+            "encode_cols": list(encode_cols),
+            "dummy_cols": [name_map[c] for c in dummy_cols_raw if c in name_map],
+            "name_map": dict(name_map),
+        }
         st.session_state["results_hyperparams"] = {
             "head_length": int(head_length),
             "n_genes": int(n_genes),
@@ -1684,11 +2048,15 @@ with st.sidebar:
             "pop_size": int(pop_size),
             "tournsize": int(tournsize),
             "champs": int(champs),
+            "n_elites": int(n_elites),
             "val_frac": float(val_frac),
             "ptrains": list(ptrains),
             "seeds": list(seeds),
             "total_runs": total_runs,
             "combine_mode": combine_mode,
+            "split_mode": "study" if study_mode else "random",
+            "study_col": study_col,
+            "n_rows": len(df),
         }
         # Which of those same rows were flagged as response-variable outliers
         # in step 2, so the results plots can highlight them -- aligned
@@ -1756,43 +2124,96 @@ if "results_df" in st.session_state:
     # from a low-data level. If *none* of a level's solutions clear the bar,
     # that level's single best solution is kept anyway so it isn't dropped
     # from the analysis entirely.
+    # Study-aware runs are first reduced to ONE final solution per run (the
+    # Hall-of-Fame member with the highest R² on that run's train+validation
+    # studies); the gate then applies to those run winners only, also on
+    # train+val R². Random-split runs keep the original behaviour: every
+    # recorded solution is gated on its train+val-pool R².
+    used_study_mode = used_hyperparams.get("split_mode") == "study"
+    gate_col = "trainval_r2"
+    gate_label = "R² on train+val studies (best solution per run)" if used_study_mode else "R² (train+val pool)"
+    if used_study_mode and gate_col in results_df.columns and len(results_df):
+        best_in_run = pd.Series(best_in_run_mask(results_df), index=results_df.index)
+    else:
+        best_in_run = pd.Series(True, index=results_df.index)
     with st.container(horizontal=True, vertical_alignment="center", gap="small"):
         st.markdown(
-            "Minimum R² (train+val pool) to include a solution",
-            help="Recorded solutions below this train+val R² are excluded before ranking "
-                 "terms/features below, so weak fits don't dilute the results. Uses R² on the "
-                 "combined train+val pool (not the held-out test set), so test data is never "
-                 "used to decide which solutions to keep. Applied per training-data-availability "
-                 "level -- if none of a level's solutions clear the bar, that level's single best "
-                 "solution is kept anyway rather than dropping the level entirely. Set very low "
-                 "(e.g. -10) to effectively disable this filter.",
+            f"Minimum {gate_label} to include a solution",
+            help=(
+                "Each run is first reduced to its final best solution: of the solutions it "
+                "recorded, the one with the highest R² on that run's training + validation "
+                "studies combined. Run winners below this train+val R² are then excluded before "
+                "ranking terms/features below; a run's other solutions are never counted as "
+                "accepted. "
+                if used_study_mode else
+                "Recorded solutions below this train+val R² are excluded before ranking "
+                "terms/features below, so weak fits don't dilute the results. Uses R² on the "
+                "combined train+val pool (not the held-out test set), so test data is never "
+                "used to decide which solutions to keep. "
+            ) + (
+                "Applied per training-data-availability level -- if none of a level's solutions "
+                "clear the bar, that level's single best solution is kept anyway rather than "
+                "dropping the level entirely. Set very low (e.g. -10) to effectively disable "
+                "this filter."
+            ),
         )
         min_trainval_r2 = st.number_input(
-            "Minimum R² (train+val pool) to include a solution",
+            f"Minimum {gate_label} to include a solution",
             min_value=-100.0, max_value=1.0, value=0.5, step=0.05, format="%.2f",
             label_visibility="collapsed", width=90, key="min_trainval_r2",
         )
 
-    if "trainval_r2" in results_df.columns and len(results_df):
+    if gate_col in results_df.columns and len(results_df):
         # Vectorized per-group floor (rather than groupby().apply()) so the
         # "ptrain" grouping column can't get silently dropped by pandas.
-        keep_mask = results_df["trainval_r2"] >= min_trainval_r2
+        # Only candidates (every solution in random mode, run winners in study
+        # mode) can be accepted; the per-level fallback also picks among them.
+        keep_mask = best_in_run & (results_df[gate_col] >= min_trainval_r2)
         kept_counts = results_df.loc[keep_mask].groupby("ptrain").size()
-        best_idx_per_group = results_df.groupby("ptrain")["trainval_r2"].idxmax()
+        _cands = results_df.loc[best_in_run]
+        best_idx_per_group = _cands[gate_col].fillna(-np.inf).groupby(_cands["ptrain"]).idxmax()
         for ptrain_val in results_df["ptrain"].unique():
             if kept_counts.get(ptrain_val, 0) == 0:
                 keep_mask.loc[best_idx_per_group[ptrain_val]] = True
         ranked_solutions_df = results_df[keep_mask]
-        n_dropped = len(results_df) - len(ranked_solutions_df)
-        if n_dropped > 0:
+        if used_study_mode:
+            n_winners = int(best_in_run.sum())
+            n_dropped = n_winners - int((keep_mask & best_in_run).sum())
             st.caption(
-                f"{n_dropped} of {len(results_df)} recorded solution(s) excluded from the term "
-                f"ranking below (train+val R² < {min_trainval_r2:.2f})."
+                f"Each of the {n_winners} runs contributes its best solution by train+val R² "
+                f"(the other {len(results_df) - n_winners} recorded solutions are not counted); "
+                + (
+                    f"{n_dropped} of those {n_winners} run winners are excluded from the term ranking "
+                    f"below ({gate_label.split(' (')[0]} < {min_trainval_r2:.2f})."
+                    if n_dropped > 0 else "all of them pass the gate."
+                )
             )
+        else:
+            n_dropped = len(results_df) - len(ranked_solutions_df)
+            if n_dropped > 0:
+                st.caption(
+                    f"{n_dropped} of {len(results_df)} recorded solution(s) excluded from the term "
+                    f"ranking below ({gate_label} < {min_trainval_r2:.2f})."
+                )
     else:
         # Results recorded before this filter existed won't have this column.
+        keep_mask = pd.Series(True, index=results_df.index)
         ranked_solutions_df = results_df
         st.caption("(Results predate the train+val R² column -- quality filter unavailable; showing all solutions.)")
+
+    # Every term/feature's presence across ALL recorded solutions, across the
+    # ACCEPTED ones (past the R² gate above), and per training-data level --
+    # shown in the More tab, downloadable as CSV, and included in the report.
+    _parsed_all = _parse_exprs_cached(tuple(results_df["expr"].astype(str)))
+    presence = presence_stats(
+        _parsed_all, results_df["ptrain"].tolist(), keep_mask.tolist(),
+    )
+    term_presence_df = presence["term_df"]
+    feature_presence_df = presence["feature_df"]
+    final_equations_df = _final_equations_table(
+        results_df, keep_mask, gate_col, min_trainval_r2, used_physics_formula, used_combine_mode,
+        best_in_run=best_in_run if used_study_mode else None,
+    )
 
     report = parse_results_df(
         ranked_solutions_df, by_ptrain=(ranked_solutions_df["ptrain"].nunique() > 1),
@@ -1894,6 +2315,49 @@ if "results_df" in st.session_state:
                      "those slots too, ranked purely by how often each term recurs across recorded solutions.",
             )
 
+            st.divider()
+            st.subheader("Presence: all solutions vs. accepted vs. each training level")
+            _acc_by_lvl = ", ".join(
+                f"{p * 100:g}%: {presence['n_accepted_by_level'][p]} of {presence['n_all_by_level'][p]}"
+                for p in presence["levels"]
+            )
+            st.caption(
+                f"**All** = share of all {presence['n_all']} recorded solutions containing the "
+                f"term/feature. **Accepted** = share of the {presence['n_accepted']} solutions past "
+                f"the {gate_label} gate above. **Per-level** columns = share of that training "
+                f"level's accepted solutions (accepted of all, per level: {_acc_by_lvl}). The CSV "
+                f"downloads below also have per-level counts and per-level % of all solutions."
+            )
+
+            def _presence_display(df_in, label_col, pretty_map=None):
+                if not len(df_in):
+                    return df_in, {}
+                lvl_cols = [f"pct_accepted_ptrain_{p:g}" for p in presence["levels"]]
+                keep = [label_col] + (["n_variables"] if "n_variables" in df_in.columns else []) + [
+                    "pct_all", "pct_accepted"] + lvl_cols
+                out = df_in[keep].copy()
+                if pretty_map:
+                    out[label_col] = out[label_col].map(pretty_map).fillna(out[label_col])
+                rename = {c: f"{p * 100:g}% training" for c, p in zip(lvl_cols, presence["levels"])}
+                rename.update({"pct_all": "% all", "pct_accepted": "% accepted"})
+                out = out.rename(columns=rename)
+                cfg = {
+                    c: st.column_config.ProgressColumn(c, format="%.1f%%", min_value=0, max_value=100, width="small")
+                    for c in ["% all", "% accepted", *rename.values()]
+                }
+                return out, cfg
+
+            _presence_pretty = dict(zip(
+                term_presence_df["term"] if len(term_presence_df) else [],
+                (_pretty_term_text(s) for s in presence["term_sigs"]),
+            ))
+            st.markdown("**Terms / interactions**")
+            _tp_disp, _tp_cfg = _presence_display(term_presence_df, "term", _presence_pretty)
+            st.dataframe(_tp_disp, hide_index=True, width="stretch", height=260, column_config=_tp_cfg)
+            st.markdown("**Features (anywhere in the expression)**")
+            _fp_disp, _fp_cfg = _presence_display(feature_presence_df, "feature")
+            st.dataframe(_fp_disp, hide_index=True, width="stretch", height=220, column_config=_fp_cfg)
+
             if "by_ptrain_df" in report:
                 st.divider()
                 st.subheader("Term frequency by training-data-availability level")
@@ -1971,6 +2435,22 @@ if "results_df" in st.session_state:
                 d3.download_button(
                     "⬇️ Terms ranked CSV", term_df.to_csv(index=False), file_name="terms_ranked.csv",
                     mime="text/csv", width="stretch",
+                )
+                d4, d5, d6 = st.columns(3, gap="medium")
+                d4.download_button(
+                    "⬇️ Term presence CSV (all / accepted / per level)",
+                    term_presence_df.to_csv(index=False), file_name="term_presence.csv",
+                    mime="text/csv", width="stretch",
+                )
+                d5.download_button(
+                    "⬇️ Feature presence CSV (all / accepted / per level)",
+                    feature_presence_df.to_csv(index=False), file_name="feature_presence.csv",
+                    mime="text/csv", width="stretch",
+                )
+                d6.download_button(
+                    "⬇️ Final equations CSV (every solution, with R²)",
+                    final_equations_df.to_csv(index=False), file_name="final_equations.csv",
+                    mime="text/csv", width="stretch", key="final_equations_download_btn",
                 )
 
         # ----------------------------------------------------------------
@@ -2482,10 +2962,37 @@ if "results_df" in st.session_state:
                     controls_col, plot_col = st.columns([1, 1.2], gap="large")
 
                     with controls_col:
+                        groups_whole = st.session_state.get("results_groups")
+                        use_study_split = groups_whole is not None and len(groups_whole) == len(y_actual)
                         train_frac = st.slider(
                             "Training fraction for this regression", min_value=0.1, max_value=0.9, value=0.7, step=0.05,
-                            help="Fraction of rows used to fit the weights below; the rest are held out to evaluate the equation.",
+                            help=(
+                                "Fraction of rows used to fit the weights below, filled with whole studies "
+                                "(same rule as the search: whole studies until the next would overshoot, "
+                                "then part of one more, whose leftover rows are set aside). Every untouched "
+                                "study is held out to evaluate the equation, so test studies are never "
+                                "seen by the fit."
+                                if use_study_split else
+                                "Fraction of rows used to fit the weights below; the rest are held out to evaluate the equation."
+                            ),
                         )
+                        # Row indices for the fit/held-out split, computed once
+                        # and applied to every array below. Random mode splits
+                        # row indices with the same seed as before, so it picks
+                        # exactly the same rows it always did.
+                        if use_study_split:
+                            try:
+                                fit_tr_idx, fit_te_idx, fit_study_info = study_split_indices(
+                                    groups_whole, train_frac, seed=42,
+                                )
+                            except ValueError as e:
+                                st.error(f"{e}")
+                                st.stop()
+                        else:
+                            fit_tr_idx, fit_te_idx = train_test_split(
+                                np.arange(len(y_actual)), train_size=train_frac, random_state=42,
+                            )
+                            fit_study_info = None
                         method = st.radio(
                             "Weighting algorithm", ["Linear (OLS)", "Ridge (L2-regularized)"], horizontal=True,
                             help=(
@@ -2527,10 +3034,10 @@ if "results_df" in st.session_state:
                                     f"fractional correction below."
                                 )
                             z_target = y_actual / phys_clipped_wr - 1.0
-                            (X_train, X_test, z_train, z_test, y_train, y_test,
-                             phys_train_wr, phys_test_wr) = train_test_split(
-                                X, z_target, y_actual, phys_clipped_wr, train_size=train_frac, random_state=42,
-                            )
+                            X_train, X_test = X[fit_tr_idx], X[fit_te_idx]
+                            z_train, z_test = z_target[fit_tr_idx], z_target[fit_te_idx]
+                            y_train, y_test = y_actual[fit_tr_idx], y_actual[fit_te_idx]
+                            phys_train_wr, phys_test_wr = phys_clipped_wr[fit_tr_idx], phys_clipped_wr[fit_te_idx]
                             if method == "Ridge (L2-regularized)":
                                 reg = Ridge(alpha=ridge_alpha, fit_intercept=False).fit(X_train, z_train)
                             else:
@@ -2547,9 +3054,8 @@ if "results_df" in st.session_state:
                             build_seed_weights = ([1.0] if used_physics_formula else []) + list(reg.coef_)
                         else:
                             X = np.column_stack(regressors)
-                            X_train, X_test, y_train, y_test = train_test_split(
-                                X, y_actual, train_size=train_frac, random_state=42,
-                            )
+                            X_train, X_test = X[fit_tr_idx], X[fit_te_idx]
+                            y_train, y_test = y_actual[fit_tr_idx], y_actual[fit_te_idx]
                             # No intercept: the equation should be pure weights on physics + the
                             # terms, nothing else.
                             if method == "Ridge (L2-regularized)":
@@ -2564,10 +3070,29 @@ if "results_df" in st.session_state:
                             build_seed_weights = list(reg.coef_)
 
                         gep_equation(
-                            f"Fitted equation ({train_frac:.0%} train split, {method}):<br>",
+                            f"Fitted equation ({train_frac:.0%} train split"
+                            + (" by study" if use_study_split else "") + f", {method}):<br>",
                             _equation_to_html(equation),
                         )
                         st.caption(f"train R² = {train_r2:.3f} (n={len(y_train)}), test R² = {test_r2:.3f} (n={len(y_test)}, held out)")
+                        if fit_study_info is not None:
+                            _n_tr_st = len(fit_study_info["train_studies"]) + (
+                                1 if fit_study_info["partial_study"] is not None else 0
+                            )
+                            st.caption(
+                                f"Split by study: {_n_tr_st} studies train, "
+                                f"{len(fit_study_info['val_studies'])} held-out studies test"
+                                + (
+                                    f"; {fit_study_info['n_partial_dropped']} leftover row(s) of the "
+                                    f"partly used study {fit_study_info['partial_study']} are in neither."
+                                    if fit_study_info["n_partial_dropped"] else "."
+                                )
+                                + (
+                                    f" (Study order was reshuffled {fit_study_info['n_reshuffles']} time(s) "
+                                    f"so at least one study is held out.)"
+                                    if fit_study_info.get("n_reshuffles") else ""
+                                )
+                            )
 
                     with plot_col:
                         fig, ax = plt.subplots(figsize=(4, 3.2))
@@ -3084,9 +3609,86 @@ if "results_df" in st.session_state:
                         "comparison (plot + full data table). Nothing is generated until you click "
                         "the button below."
                     )
+                    # Optional external test set: never seen by the search, the
+                    # R² gate or the equation fitting -- only scored here, when
+                    # the report is generated.
+                    test_upload = st.file_uploader(
+                        "Optional: external test set (CSV or Excel), used only for this report",
+                        type=["csv", "tsv", "xlsx", "xls"], key="report_test_upload",
+                        help="A separate file with the same columns as the development data. Nothing "
+                             "else in the app uses it: when you generate the report, every recorded "
+                             "final equation, the physics formula, each top term and your combined "
+                             "equation are scored on it.",
+                    )
+                    test_df = None
+                    if test_upload is not None:
+                        try:
+                            _t_raw = _load_dataset_bytes(test_upload.getvalue(), test_upload.name)
+                            test_df, _t_dropped = _prepare_external_test(
+                                _t_raw, st.session_state.get("results_prep"),
+                                plot_feature_names, plot_target_name,
+                            )
+                            if len(test_df) < 2:
+                                st.error("The test set needs at least 2 complete rows.")
+                                test_df = None
+                            else:
+                                st.caption(
+                                    f"Test set `{test_upload.name}`: {len(test_df)} row(s) will be scored"
+                                    + (f" ({_t_dropped} row(s) with missing/non-numeric values skipped)."
+                                       if _t_dropped else ".")
+                                )
+                        except ValueError as e:
+                            st.error(str(e))
+                            test_df = None
+                        except Exception as e:
+                            st.error(f"Could not read the test set: {e}")
+                            test_df = None
+
                     if st.button("Generate report", type="primary", key="report_generate_btn"):
                         phys_stats = _regression_stats(y_actual, phys_vals_whole)
                         fit_stats = _regression_stats(y_actual, custom_pred)
+
+                        report_final_eqs = final_equations_df
+                        test_eval = None
+                        if test_df is not None:
+                            X_t = test_df[plot_feature_names].to_numpy(dtype=float)
+                            y_t = test_df[plot_target_name].to_numpy(dtype=float)
+                            phys_t = phys_fn_whole(X_t)
+                            term_t = [make_physics_fn(ts, plot_feature_names)(X_t) for ts, _, _ in good_terms]
+                            # The combined equation exactly as built in "Build your
+                            # own equation": same weights, scale and bias.
+                            regs_t = ([phys_t] if used_physics_formula else []) + term_t
+                            w_arr = np.array(weights)
+                            if mult_mode:
+                                raw_t = w_arr[0] * phys_t * (1 + np.column_stack(term_t) @ w_arr[1:])
+                            else:
+                                raw_t = np.column_stack(regs_t) @ w_arr
+                            if scale_desc is not None:
+                                raw_scaled_t = (scale_desc[0] + scale_desc[1] * raw_t) * raw_t
+                            else:
+                                raw_scaled_t = scale * raw_t
+                            custom_t = raw_scaled_t + bias
+                            test_eval = {
+                                "label": test_upload.name,
+                                "n": len(y_t),
+                                "rows": (
+                                    [("Physics only", _regression_stats(y_t, phys_t))]
+                                    + [
+                                        (f"Physics + {row['term']}", _regression_stats(y_t, phys_t + tv))
+                                        for tv, (_, _, row) in zip(term_t, good_terms)
+                                    ]
+                                    + [("Combined (fitted / custom) equation", _regression_stats(y_t, custom_t))]
+                                ),
+                            }
+                            # Every recorded final equation, scored on the test set.
+                            fe_stats = [
+                                _safe_stats(y_t, eq, plot_feature_names, X_t)
+                                for eq in final_equations_df["final_equation"]
+                            ]
+                            report_final_eqs = final_equations_df.copy()
+                            for col, key in (("ext_test_r2", "R2"), ("ext_test_mae", "MAE"),
+                                             ("ext_test_rmse", "RMSE")):
+                                report_final_eqs[col] = [s[key] if s else np.nan for s in fe_stats]
 
                         fig_r, (ax_p, ax_f) = plt.subplots(1, 2, figsize=(8, 3.6))
                         ax_p.scatter(y_actual, phys_vals_whole, alpha=0.6, edgecolors="none", s=14, color="tab:blue")
@@ -3191,6 +3793,10 @@ if "results_df" in st.session_state:
                             dataset_label=used_dataset_label,
                             feature_names=plot_feature_names,
                             hyperparams=used_hyperparams,
+                            presence=presence,
+                            gate_label=f"{gate_label} ≥ {min_trainval_r2:.2f}",
+                            final_equations=report_final_eqs,
+                            test_eval=test_eval,
                         )
                         st.session_state["report_html"] = report_html
                         st.session_state["report_filename"] = (

@@ -236,6 +236,86 @@ def parse_results_df(df, by_ptrain=False, physics_formula=None):
     return result
 
 
+def parse_expressions(exprs):
+    """Parse each expression string once. Returns a list aligned with
+    `exprs`: (frozenset_of_variables, frozenset_of_term_signatures) per
+    expression, or None where parsing failed."""
+    out = []
+    for e in exprs:
+        try:
+            variables_present, term_sigs = parse_expression(e)
+            out.append((frozenset(variables_present), frozenset(term_sigs)))
+        except Exception:
+            out.append(None)
+    return out
+
+
+def _level_col(prefix, ptrain):
+    return f"{prefix}_ptrain_{ptrain:g}"
+
+
+def presence_stats(parsed, ptrains, accepted):
+    """For every term and every feature: how many recorded solutions contain
+    it, out of (a) all solutions, (b) accepted solutions (`accepted` is a
+    bool per solution, e.g. past an R² gate), and (c) each
+    training-data-availability level, both all and accepted. A term/feature
+    counts at most once per solution. Unparseable solutions still count in
+    every denominator, matching parse_results_df.
+
+    `parsed` comes from parse_expressions(); `ptrains` and `accepted` are
+    aligned with it. Returns dict(term_df, term_sigs, feature_df, n_all,
+    n_accepted, n_all_by_level, n_accepted_by_level, levels)."""
+    levels = sorted(set(ptrains))
+    n_all = len(parsed)
+    n_accepted = int(sum(bool(a) for a in accepted))
+    n_all_lvl = Counter(ptrains)
+    n_acc_lvl = Counter(p for p, a in zip(ptrains, accepted) if a)
+
+    def _pct(c, n):
+        return round(100 * c / n, 1) if n else 0.0
+
+    def _table(key_index, label_fn, label_col, extra_fn=None):
+        c_all, c_acc = Counter(), Counter()
+        c_all_lvl, c_acc_lvl = defaultdict(Counter), defaultdict(Counter)
+        for item, p, a in zip(parsed, ptrains, accepted):
+            if item is None:
+                continue
+            for k in item[key_index]:
+                c_all[k] += 1
+                c_all_lvl[p][k] += 1
+                if a:
+                    c_acc[k] += 1
+                    c_acc_lvl[p][k] += 1
+        keys = sorted(c_all, key=lambda k: (-c_acc[k], -c_all[k], label_fn(k)))
+        rows = []
+        for k in keys:
+            row = {label_col: label_fn(k)}
+            if extra_fn:
+                row.update(extra_fn(k))
+            row.update({
+                "n_all": c_all[k], "pct_all": _pct(c_all[k], n_all),
+                "n_accepted": c_acc[k], "pct_accepted": _pct(c_acc[k], n_accepted),
+            })
+            for p in levels:
+                row[_level_col("n_accepted", p)] = c_acc_lvl[p][k]
+                row[_level_col("pct_accepted", p)] = _pct(c_acc_lvl[p][k], n_acc_lvl[p])
+            for p in levels:
+                row[_level_col("n_all", p)] = c_all_lvl[p][k]
+                row[_level_col("pct_all", p)] = _pct(c_all_lvl[p][k], n_all_lvl[p])
+            rows.append(row)
+        return pd.DataFrame(rows), keys
+
+    term_df, term_keys = _table(1, signature_label, "term", lambda s: {"n_variables": len(s)})
+    feature_df, _ = _table(0, str, "feature")
+    return dict(
+        term_df=term_df, term_sigs=term_keys, feature_df=feature_df,
+        n_all=n_all, n_accepted=n_accepted,
+        n_all_by_level={p: n_all_lvl[p] for p in levels},
+        n_accepted_by_level={p: n_acc_lvl[p] for p in levels},
+        levels=levels,
+    )
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--in", dest="infile", default="results/sweep_results.csv")
